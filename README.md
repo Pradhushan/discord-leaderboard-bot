@@ -1,1 +1,0 @@
-# discord-leaderboard-bot
