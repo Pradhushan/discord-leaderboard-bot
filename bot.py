@@ -17,56 +17,77 @@ PROGRESS_CH = int(os.environ["PROGRESS_CHANNEL_ID"])
 BOARD_CH = int(os.environ["LEADERBOARD_CHANNEL_ID"])
 STUDENT_ROLE = int(os.environ["STUDENT_ROLE_ID"])
 ROLE_MODEL_ID = int(os.environ["ROLE_MODEL_ID"])  # NotYourFriend / Tharuka
-ROLE_MODEL_MIN = 600
-ROLE_MODEL_CAPTION = "Catch me if u can! 🏎️💨"
+ROLE_MODEL_MIN = 600  # his 10h default
 BASELINE = int(os.environ.get("BASELINE_MINUTES", "240"))
 EXAM_DATE = dt.date.fromisoformat(os.environ.get("EXAM_DATE", "2027-08-03"))
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+FALLBACKS = [m.strip() for m in os.environ.get("GEMINI_FALLBACKS", "").split(",") if m.strip()]
+RETRY_DELAYS = [2, 5, 10, 20]  # seconds between retries
 ai = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-
-# Add 10-15 more of YOUR best captions here. This is what makes the slang feel real.
-CAPTION_EXAMPLES = [
-    "Block set එකම අතුගාලා 6h+ ගැහුවා! 📝⚡",
-    "Tharukaගේ B'day එක අස්සේ 4h+ baseline goda! 📝⚡",
-    "14h ගැහුවට පස්සේ adath full afk! 💀💤",
-]
 
 # ---------- AI ----------
 async def ask_json(prompt: str, temperature: float):
-    def call():
-        r = ai.models.generate_content(
-            model=MODEL, contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json", temperature=temperature),
-        )
-        return json.loads(r.text)
-    return await asyncio.to_thread(call)
+    last_err = None
+    for model in [MODEL] + FALLBACKS:
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            def call(model=model):
+                r = ai.models.generate_content(
+                    model=model, contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json", temperature=temperature),
+                )
+                return json.loads(r.text)
+            try:
+                return await asyncio.to_thread(call)
+            except Exception as ex:
+                last_err = ex
+                msg = str(ex)
+                retryable = isinstance(ex, (ValueError, TypeError)) or any(
+                    k in msg for k in ("503", "429", "500", "UNAVAILABLE", "RESOURCE_EXHAUSTED"))
+                if not retryable or attempt == len(RETRY_DELAYS):
+                    break  # give up on this model, try the next one
+                await asyncio.sleep(RETRY_DELAYS[attempt])
+    raise last_err
 
 EXTRACT_PROMPT = """You read daily study-progress messages posted by Sri Lankan A/L students.
-For each message return the TOTAL study time that was actually completed.
+For each message return the TOTAL study time actually completed, plus what they worked on.
 Rules:
 - If the message states a total (e.g. "Σt = 6hrs 41mins", "Total - 1 hr 25 mins"), use it.
 - Otherwise add up the completed items. Skip items marked ❌ or clearly not done.
-- Ignore goals/headers like "8hrs+ today?" or a date such as "03.11". Those are NOT study time.
+- "title" is the header/goal line if there is one (e.g. "8hrs+ today? 03.11"), else "".
+  The title is NOT study time.
+- "topics" is a list of the subjects/chapters studied, each max 4 words, with their minutes if given.
 - Text may use fancy unicode fonts (𝓱𝓻 𝓶𝓲𝓷𝓼). Read them normally.
 - Units: hr/hrs/h = hours, min/mins/m = minutes.
-- confident=false if you had to guess or the message has no usable time.
-Return ONLY a JSON list: [{"id": "...", "total_minutes": int, "summary": "max 6 words, topics studied", "confident": bool}]
+- confident=false if you had to guess or there is no usable time.
+Return ONLY a JSON list:
+[{"id": "...", "total_minutes": int, "title": "...", "topics": ["..."], "confident": bool}]
 Messages:
 """
 
-CAPTION_PROMPT = """You write one-line captions for a Sri Lankan A/L study-group leaderboard, roasting/hyping friends.
-Style rules:
-- Natural Sri Lankan teen Singlish: Sinhala script for Sinhala words mixed with English study terms. Like a friend texting in a group chat.
-- NEVER formal or textbook Sinhala. Never robotic, never a translation of English.
-- Max ~12 words. Reference their real topics/time from the data when it helps.
-- passed=true: hype and respect. passed=false: light savage roast.
-- End with exactly two emojis. No hashtags, no quotes.
-- Vary the wording. Do not copy the examples, only match their tone.
-Examples of the tone:
-{examples}
+CAPTION_PROMPT = """You write one-line captions for a Sri Lankan A/L study-group leaderboard.
+You are a funny friend in the group chat, hyping or roasting each person based on THEIR day.
 
-Return ONLY a JSON list: [{{"id": "...", "caption": "..."}}]
+Voice:
+- Real Sri Lankan teen Singlish, the way friends text. Sinhala script mixed with English study words
+  (block, set, past paper, baseline, afk, grind, chapter names).
+- Casual slang, e.g. machan, goda, ගැහුවා, අතුගාලා, ඉවරයි, පට්ට, ඔහොමම යං.
+  These are only vocabulary hints. Use whatever fits naturally and don't force them in.
+- NEVER formal or textbook Sinhala. Never sound like a translation or a motivational poster.
+
+Content rules:
+- Every caption must reference something specific from that person's data: a topic, the hours,
+  or their title/goal. No generic lines that could fit anyone.
+- passed=true: hype and respect. passed=false: light, friendly roast (if they posted a goal title
+  they missed, roast the gap between goal and reality).
+- If minutes is 0 and topics is ["no post"], they posted nothing. Roast the silence.
+- If role_model=true (this person studies 10h daily, the group's untouchable benchmark),
+  the caption must sound like a calm, cocky flex or the group worshipping him.
+  Fresh wording each day, but the spirit of "catch me if u can" fits.
+- Max ~12 words. End with exactly two emojis. No hashtags, no quotes.
+- Never reuse wording across people in the same list. Every caption must be different.
+
+Return ONLY a JSON list: [{"id": "...", "caption": "..."}]
 Data (baseline_minutes is the pass mark):
 """
 
@@ -75,17 +96,19 @@ async def extract(texts: dict):
         return {}
     payload = [{"id": str(k), "text": v} for k, v in texts.items()]
     out = await ask_json(EXTRACT_PROMPT + json.dumps(payload, ensure_ascii=False), 0.0)
+    if isinstance(out, dict):
+        out = [out]
     return {int(o["id"]): o for o in out}
 
 async def write_captions(entries):
     rows = [{"id": str(e["uid"]), "name": e["name"], "minutes": e["minutes"],
-             "passed": e["passed"], "summary": e["summary"], "baseline_minutes": BASELINE}
-            for e in entries if e["uid"] != ROLE_MODEL_ID]
-    if not rows:
-        return {}
-    prompt = CAPTION_PROMPT.format(examples="\n".join(f"- {c}" for c in CAPTION_EXAMPLES))
+             "passed": e["passed"], "title": e["title"], "topics": e["topics"],
+             "role_model": e["uid"] == ROLE_MODEL_ID, "baseline_minutes": BASELINE}
+            for e in entries]
     try:
-        out = await ask_json(prompt + json.dumps(rows, ensure_ascii=False), 1.0)
+        out = await ask_json(CAPTION_PROMPT + json.dumps(rows, ensure_ascii=False), 1.0)
+        if isinstance(out, dict):
+            out = [out]
         return {int(o["id"]): o["caption"].strip() for o in out}
     except Exception:
         traceback.print_exc()
@@ -105,24 +128,25 @@ async def collect(guild: discord.Guild, day: dt.date, end: dt.datetime):
     if ROLE_MODEL_ID not in members:
         members[ROLE_MODEL_ID] = guild.get_member(ROLE_MODEL_ID) or await guild.fetch_member(ROLE_MODEL_ID)
 
-    texts = {u: t for u, t in last.items() if u in members and u != ROLE_MODEL_ID}
+    texts = {u: t for u, t in last.items() if u in members}
     ext = await extract(texts)
 
     entries = []
     for uid, mem in members.items():
+        e = ext.get(uid, {})
         confident = True
-        if uid == ROLE_MODEL_ID:
-            mins, summary = ROLE_MODEL_MIN, ""
-        elif uid in texts:
-            e = ext.get(uid, {})
+        if uid in texts:
+            title, topics = e.get("title", ""), e.get("topics", [])
             mins = int(e.get("total_minutes") or 0)
-            summary = e.get("summary", "")
             confident = bool(e.get("confident", False)) if e else False
         else:
-            mins, summary = 0, "no post"
+            title, topics, mins = "", ["no post"], 0
+        if uid == ROLE_MODEL_ID:
+            mins, confident = ROLE_MODEL_MIN, True  # his 10h default always applies
         mins = max(0, min(mins, 1440))
         entries.append(dict(uid=uid, member=mem, name=mem.display_name, minutes=mins,
-                            summary=summary, passed=mins >= BASELINE, confident=confident))
+                            title=title, topics=topics, passed=mins >= BASELINE,
+                            confident=confident))
     entries.sort(key=lambda e: -e["minutes"])
     return entries
 
@@ -196,7 +220,7 @@ async def build(guild, day: dt.date, end: dt.datetime):
     lines = [f"🔥 _*THE GRIND*_ 🔥 — {ordinal(day.day)} {day.strftime('%b')}",
              f"⏳ {days_left} DAYS MORE!", ""]
     for e in entries:
-        cap = ROLE_MODEL_CAPTION if e["uid"] == ROLE_MODEL_ID else caps.get(e["uid"], "📝⚡")
+        cap = caps.get(e["uid"], "📝⚡")
         mark = "✅" if e["passed"] else "❌"
         lines.append(f"{mark} _*{e['name']}*_ (_{fmt(e['minutes'])}_): {cap}")
     p = sum(e["passed"] for e in entries)
@@ -225,7 +249,7 @@ class Bot(discord.Client):
         runner = web.AppRunner(app)
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
-        self.loop.create_task(nightly())
+        asyncio.create_task(nightly())
 
 bot = Bot()
 
