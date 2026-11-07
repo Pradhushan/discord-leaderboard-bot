@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
+from discord.utils import escape_markdown
 from aiohttp import web
 from google import genai
 from google.genai import types
@@ -24,6 +25,7 @@ MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 FALLBACKS = [m.strip() for m in os.environ.get("GEMINI_FALLBACKS", "").split(",") if m.strip()]
 RETRY_DELAYS = [2, 5, 10, 20]  # seconds between retries
 ai = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+RUN_LOCK = asyncio.Lock()  # only one leaderboard build at a time (saves memory)
 
 # ---------- AI ----------
 async def ask_json(prompt: str, temperature: float):
@@ -172,7 +174,7 @@ text-shadow:0 0 15px rgba(255,202,40,0.5)}
 border:1px solid rgba(255,42,42,0.35);box-shadow:0 0 25px 4px rgba(255,42,42,0.18);box-sizing:border-box}
 .rank{font-size:36px;font-weight:700;width:90px;letter-spacing:1px}
 .profile-pic{width:76px;height:76px;border-radius:50%;object-fit:cover;margin-right:35px;border:none}
-.name{font-size:32px;font-weight:700;letter-spacing:3px;flex-grow:1}
+.name{font-size:32px;font-weight:700;letter-spacing:3px;flex-grow:1;overflow:hidden;white-space:nowrap}
 .time{font-size:32px;font-weight:700;color:#ffca28;letter-spacing:2px}
 .footer{font-family:'Orbitron',sans-serif;font-size:24px;letter-spacing:8px;color:#fff;font-weight:700;
 text-shadow:0 0 10px rgba(255,255,255,0.5)}
@@ -183,6 +185,9 @@ text-shadow:0 0 10px rgba(255,255,255,0.5)}
 async def avatar_uri(member: discord.Member):
     data = await member.display_avatar.replace(size=128, format="png").read()
     return "data:image/png;base64," + base64.b64encode(data).decode()
+
+BROWSER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                "--disable-extensions", "--disable-background-networking"]
 
 async def render(entries, days_left: int) -> bytes:
     cards = ""
@@ -195,12 +200,17 @@ async def render(entries, days_left: int) -> bytes:
                   f'<div class="time">{h:02d}H {m:02d}M</div></div>')
     page = HEAD + cards + f'</div><div class="footer">{days_left} DAYS MORE!</div></div></body></html>'
     async with async_playwright() as p:
-        browser = await p.chromium.launch(args=["--no-sandbox"])
-        pg = await browser.new_page(viewport={"width": 1200, "height": 1200})
-        await pg.set_content(page, wait_until="networkidle")
-        await pg.evaluate("document.fonts.ready")
-        png = await pg.locator("#capture-area").screenshot()
-        await browser.close()
+        browser = await p.chromium.launch(args=BROWSER_ARGS)
+        try:
+            pg = await browser.new_page(viewport={"width": 1080, "height": 1080})
+            await pg.set_content(page, wait_until="load", timeout=30000)
+            try:
+                await asyncio.wait_for(pg.evaluate("document.fonts.ready"), timeout=10)
+            except Exception:
+                pass  # fonts slow? screenshot anyway with fallback fonts
+            png = await pg.locator("#capture-area").screenshot()
+        finally:
+            await browser.close()
     return png
 
 # ---------- TEXT ----------
@@ -211,24 +221,50 @@ def ordinal(n):
 def fmt(m): return f"{m // 60:02d}h {m % 60:02d}m"
 def fmt_short(m): return f"{m // 60}h" if m % 60 == 0 else f"{m // 60}h {m % 60}m"
 
+def chunk(text: str, limit: int = 1900):
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        if len(cur) + len(line) + 1 > limit and cur:
+            parts.append(cur)
+            cur = ""
+        cur += line + "\n"
+    if cur.strip():
+        parts.append(cur)
+    return parts
+
 async def build(guild, day: dt.date, end: dt.datetime):
     entries = await collect(guild, day, end)
     caps = await write_captions(entries)
     days_left = max(0, (EXAM_DATE - day).days)
     png = await render(entries, days_left)
 
-    lines = [f"🔥 _*THE GRIND*_ 🔥 — {ordinal(day.day)} {day.strftime('%b')}",
-             f"⏳ {days_left} DAYS MORE!", ""]
-    for e in entries:
+    def line(e):
         cap = caps.get(e["uid"], "📝⚡")
         mark = "✅" if e["passed"] else "❌"
-        lines.append(f"{mark} _*{e['name']}*_ (_{fmt(e['minutes'])}_): {cap}")
-    p = sum(e["passed"] for e in entries)
-    lines += ["", f"_*{fmt_short(BASELINE)} baseline. {p} passed, {len(entries) - p} failed.*_"]
-    shaky = [e["name"] for e in entries if not e["confident"]]
+        return f"{mark} _*{escape_markdown(e['name'])}*_ (_{fmt(e['minutes'])}_): {cap}"
+
+    passed = [e for e in entries if e["passed"]]
+    failed = [e for e in entries if not e["passed"]]
+
+    lines = [f"🔥 _*THE GRIND*_ 🔥 — {ordinal(day.day)} {day.strftime('%b')}",
+             f"⏳ {days_left} DAYS MORE!", ""]
+    lines += [line(e) for e in passed]
+    if passed and failed:
+        lines.append("-")  # separator between passed and failed
+    lines += [line(e) for e in failed]
+    lines += ["", f"_*{fmt_short(BASELINE)} baseline. {len(passed)} passed, {len(failed)} failed.*_"]
+    shaky = [escape_markdown(e["name"]) for e in entries if not e["confident"]]
     if shaky:
         lines.append(f"⚠️ Couldn't read these confidently, check manually: {', '.join(shaky)}")
     return png, "\n".join(lines)
+
+async def post_board(guild, png: bytes, text: str, prefix: str = ""):
+    ch = guild.get_channel(BOARD_CH) or await guild.fetch_channel(BOARD_CH)
+    # 1) image first, 2) captions after
+    await ch.send(content=prefix or None, file=discord.File(io.BytesIO(png), "leaderboard.png"))
+    for part in chunk(text):
+        await ch.send(part)
+    return ch
 
 # ---------- BOT ----------
 intents = discord.Intents.default()
@@ -253,19 +289,23 @@ class Bot(discord.Client):
 
 bot = Bot()
 
-@bot.tree.command(name="testnow", description="Generate the leaderboard right now (test)")
+@bot.tree.command(name="testnow", description="Generate the leaderboard now (posts in the leaderboard channel)")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
 async def testnow(inter: discord.Interaction):
-    await inter.response.defer()
-    try:
-        now = dt.datetime.now(TZ)
-        png, text = await build(inter.guild, now.date(), now)
-        await inter.followup.send(content="🧪 **TEST RUN**\n" + text,
-                                  file=discord.File(io.BytesIO(png), "leaderboard.png"))
-    except Exception as ex:
-        traceback.print_exc()
-        await inter.followup.send(f"⚠️ Failed: `{ex}`")
+    await inter.response.defer(ephemeral=True)
+    if RUN_LOCK.locked():
+        await inter.followup.send("⏳ A leaderboard is already being generated. Wait for it to finish.", ephemeral=True)
+        return
+    async with RUN_LOCK:
+        try:
+            now = dt.datetime.now(TZ)
+            png, text = await build(inter.guild, now.date(), now)
+            ch = await post_board(inter.guild, png, text, prefix="🧪 **TEST RUN**")
+            await inter.followup.send(f"✅ Posted in {ch.mention}", ephemeral=True)
+        except Exception as ex:
+            traceback.print_exc()
+            await inter.followup.send(f"⚠️ Failed: `{ex}`", ephemeral=True)
 
 async def nightly():
     await bot.wait_until_ready()
@@ -278,18 +318,21 @@ async def nightly():
         await asyncio.sleep((run_at - now).total_seconds())
         day = run_at.date()
         payload, err = None, None
-        try:
-            payload = await build(guild, day, run_at)
-        except Exception as ex:
-            traceback.print_exc()
-            err = ex
+        async with RUN_LOCK:
+            try:
+                payload = await build(guild, day, run_at)
+            except Exception as ex:
+                traceback.print_exc()
+                err = ex
         post_at = dt.datetime.combine(day + dt.timedelta(days=1), dt.time(0, 1), TZ)
         await asyncio.sleep(max(0, (post_at - dt.datetime.now(TZ)).total_seconds()))
-        ch = guild.get_channel(BOARD_CH) or await guild.fetch_channel(BOARD_CH)
-        if payload:
-            png, text = payload
-            await ch.send(content=text, file=discord.File(io.BytesIO(png), "leaderboard.png"))
-        else:
-            await ch.send(f"⚠️ Leaderboard failed tonight: `{err}`")
+        try:
+            if payload:
+                await post_board(guild, *payload)
+            else:
+                ch = guild.get_channel(BOARD_CH) or await guild.fetch_channel(BOARD_CH)
+                await ch.send(f"⚠️ Leaderboard failed tonight: `{err}`")
+        except Exception:
+            traceback.print_exc()
 
 bot.run(TOKEN)
