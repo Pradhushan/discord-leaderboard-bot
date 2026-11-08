@@ -2,6 +2,7 @@ import os, io, json, base64, asyncio, traceback, html as htmllib
 import datetime as dt
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.utils import escape_markdown
@@ -19,6 +20,7 @@ BOARD_CH = int(os.environ["LEADERBOARD_CHANNEL_ID"])
 STUDENT_ROLE = int(os.environ["STUDENT_ROLE_ID"])
 ROLE_MODEL_ID = int(os.environ["ROLE_MODEL_ID"])  # NotYourFriend / Tharuka
 ROLE_MODEL_MIN = 600  # his 10h default
+ROLE_MODEL_CAPTION = "Catch me if u can! 🏎️💨"  # always this, nothing else
 BASELINE = int(os.environ.get("BASELINE_MINUTES", "240"))
 EXAM_DATE = dt.date.fromisoformat(os.environ.get("EXAM_DATE", "2027-08-03"))
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
@@ -83,10 +85,7 @@ Content rules:
 - passed=true: hype and respect. passed=false: light, friendly roast (if they posted a goal title
   they missed, roast the gap between goal and reality).
 - If minutes is 0 and topics is ["no post"], they posted nothing. Roast the silence.
-- If role_model=true (this person studies 10h daily, the group's untouchable benchmark),
-  the caption must sound like a calm, cocky flex or the group worshipping him.
-  Fresh wording each day, but the spirit of "catch me if u can" fits.
-- Max ~12 words. End with exactly two emojis. No hashtags, no quotes.
+- Max ~12 words. End with exactly two emojis. No hashtags, no quotes, no asterisks or underscores.
 - Never reuse wording across people in the same list. Every caption must be different.
 
 Return ONLY a JSON list: [{"id": "...", "caption": "..."}]
@@ -103,10 +102,13 @@ async def extract(texts: dict):
     return {int(o["id"]): o for o in out}
 
 async def write_captions(entries):
+    # Tharuka's caption is fixed, so he is not sent to the AI
     rows = [{"id": str(e["uid"]), "name": e["name"], "minutes": e["minutes"],
              "passed": e["passed"], "title": e["title"], "topics": e["topics"],
-             "role_model": e["uid"] == ROLE_MODEL_ID, "baseline_minutes": BASELINE}
-            for e in entries]
+             "baseline_minutes": BASELINE}
+            for e in entries if e["uid"] != ROLE_MODEL_ID]
+    if not rows:
+        return {}
     try:
         out = await ask_json(CAPTION_PROMPT + json.dumps(rows, ensure_ascii=False), 1.0)
         if isinstance(out, dict):
@@ -115,6 +117,10 @@ async def write_captions(entries):
     except Exception:
         traceback.print_exc()
         return {}
+
+def clean_caption(c: str) -> str:
+    # remove characters that would break Discord's italic formatting
+    return " ".join(c.replace("*", "").replace("\n", " ").split())
 
 # ---------- COLLECT ----------
 async def collect(guild: discord.Guild, day: dt.date, end: dt.datetime):
@@ -130,7 +136,7 @@ async def collect(guild: discord.Guild, day: dt.date, end: dt.datetime):
     if ROLE_MODEL_ID not in members:
         members[ROLE_MODEL_ID] = guild.get_member(ROLE_MODEL_ID) or await guild.fetch_member(ROLE_MODEL_ID)
 
-    texts = {u: t for u, t in last.items() if u in members}
+    texts = {u: t for u, t in last.items() if u in members and u != ROLE_MODEL_ID}
     ext = await extract(texts)
 
     entries = []
@@ -144,7 +150,7 @@ async def collect(guild: discord.Guild, day: dt.date, end: dt.datetime):
         else:
             title, topics, mins = "", ["no post"], 0
         if uid == ROLE_MODEL_ID:
-            mins, confident = ROLE_MODEL_MIN, True  # his 10h default always applies
+            title, topics, mins, confident = "", [], ROLE_MODEL_MIN, True  # always 10h
         mins = max(0, min(mins, 1440))
         entries.append(dict(uid=uid, member=mem, name=mem.display_name, minutes=mins,
                             title=title, topics=topics, passed=mins >= BASELINE,
@@ -176,6 +182,7 @@ border:1px solid rgba(255,42,42,0.35);box-shadow:0 0 25px 4px rgba(255,42,42,0.1
 .profile-pic{width:76px;height:76px;border-radius:50%;object-fit:cover;margin-right:35px;border:none}
 .name{font-size:32px;font-weight:700;letter-spacing:3px;flex-grow:1;overflow:hidden;white-space:nowrap}
 .time{font-size:32px;font-weight:700;color:#ffca28;letter-spacing:2px}
+.empty{font-size:30px;font-weight:700;letter-spacing:3px;text-align:center;color:#ff5252;justify-content:center}
 .footer{font-family:'Orbitron',sans-serif;font-size:24px;letter-spacing:8px;color:#fff;font-weight:700;
 text-shadow:0 0 10px rgba(255,255,255,0.5)}
 </style></head><body><div id="capture-area">
@@ -189,15 +196,17 @@ async def avatar_uri(member: discord.Member):
 BROWSER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
                 "--disable-extensions", "--disable-background-networking"]
 
-async def render(entries, days_left: int) -> bytes:
+async def render(passed_entries, days_left: int) -> bytes:
     cards = ""
-    for i, e in enumerate(entries[:5]):
+    for i, e in enumerate(passed_entries[:5]):  # image: only baseline-clearers, max 5
         av = await avatar_uri(e["member"])
         h, m = divmod(e["minutes"], 60)
         cards += (f'<div class="card"><div class="rank" style="color:{RANK_C[i]}">#{i+1}</div>'
                   f'<img class="profile-pic" src="{av}" alt="">'
                   f'<div class="name" style="color:{NAME_C[i]}">{htmllib.escape(e["name"].upper())}</div>'
                   f'<div class="time">{h:02d}H {m:02d}M</div></div>')
+    if not cards:
+        cards = '<div class="card empty">NOBODY CLEARED THE BASELINE 💀</div>'
     page = HEAD + cards + f'</div><div class="footer">{days_left} DAYS MORE!</div></div></body></html>'
     async with async_playwright() as p:
         browser = await p.chromium.launch(args=BROWSER_ARGS)
@@ -236,15 +245,18 @@ async def build(guild, day: dt.date, end: dt.datetime):
     entries = await collect(guild, day, end)
     caps = await write_captions(entries)
     days_left = max(0, (EXAM_DATE - day).days)
-    png = await render(entries, days_left)
-
-    def line(e):
-        cap = caps.get(e["uid"], "📝⚡")
-        mark = "✅" if e["passed"] else "❌"
-        return f"{mark} _*{escape_markdown(e['name'])}*_ (_{fmt(e['minutes'])}_): {cap}"
 
     passed = [e for e in entries if e["passed"]]
     failed = [e for e in entries if not e["passed"]]
+    png = await render(passed, days_left)  # image shows only those who cleared the baseline
+
+    def line(e):
+        if e["uid"] == ROLE_MODEL_ID:
+            cap = ROLE_MODEL_CAPTION
+        else:
+            cap = clean_caption(caps.get(e["uid"], "📝⚡"))
+        mark = "✅" if e["passed"] else "❌"
+        return f"{mark} **{escape_markdown(e['name'])}** (**{fmt(e['minutes'])}**): *{cap}*"
 
     lines = [f"🔥 _*THE GRIND*_ 🔥 — {ordinal(day.day)} {day.strftime('%b')}",
              f"⏳ {days_left} DAYS MORE!", ""]
@@ -266,6 +278,19 @@ async def post_board(guild, png: bytes, text: str, prefix: str = ""):
         await ch.send(part)
     return ch
 
+# ---------- KEEP-ALIVE (backup; also use UptimeRobot) ----------
+async def keepalive():
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+    async with aiohttp.ClientSession() as s:
+        while True:
+            await asyncio.sleep(600)  # every 10 minutes
+            try:
+                await s.get(url, timeout=aiohttp.ClientTimeout(total=15))
+            except Exception:
+                pass
+
 # ---------- BOT ----------
 intents = discord.Intents.default()
 intents.members = True
@@ -286,6 +311,7 @@ class Bot(discord.Client):
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
         asyncio.create_task(nightly())
+        asyncio.create_task(keepalive())
 
 bot = Bot()
 
