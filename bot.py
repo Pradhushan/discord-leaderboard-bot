@@ -193,6 +193,9 @@ def render_progress(guild):
         key=lambda m: custom_order.index(m.display_name) if m.display_name in custom_order else 999
     )
 
+    day = dt.date.fromisoformat(STATE["day"])
+    header = f"✨ Progress\n📅 Date: {ordinal(day.day)} {day.strftime('%b %Y')}\n━━━━━━━━━━━━━━━━━━━\n\n"
+
     def build(keep):
         blocks = []
         for mem in members:
@@ -200,15 +203,15 @@ def render_progress(guild):
             items = STATE["entries"].get(uid, [])
             total = sum(i[1] for i in items)
             name = mem.display_name.replace("`", "'")
-            lines = [f"📌 `{name}` • `{fmt_hm(total)}`"]
+            lines = [f"📌 **{name}** • *{fmt_hm(total)}*"]
             start = max(0, len(items) - keep) if keep else 0
             if start:
-                lines.append(f"  … {start} earlier")
+                lines.append(f"\n            … {start} earlier")
             for i in range(start, len(items)):
                 task, mins = items[i]
-                lines.append(f"  {i + 1}. {escape_markdown(task)} — `{fmt_hm(mins)}`")
-            blocks.append("\n".join(lines))
-        return "\n\n".join(blocks) or "No students found."
+                lines.append(f"\n            {i + 1}. {escape_markdown(task)} — `{fmt_hm(mins)}`")
+            blocks.append("".join(lines))
+        return header + ("\n\n".join(blocks) or "No students found.")
 
     text = build(None)
     for keep in (20, 12, 8, 5, 3, 1):  # shrink if it would exceed Discord's 2000-char limit
