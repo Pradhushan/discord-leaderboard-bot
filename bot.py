@@ -194,7 +194,7 @@ def render_progress(guild):
     )
 
     day = dt.date.fromisoformat(STATE["day"])
-    header = f"✨ Progress\n📅 Date: {ordinal(day.day)} {day.strftime('%b %Y')}\n━━━━━━━━━━━━━━━━━━━\n\n"
+    header = f"*__Progress\nDate: {ordinal(day.day)} {day.strftime('%b %Y')}__*\n\n"
 
     def build(keep):
         blocks = []
@@ -203,15 +203,15 @@ def render_progress(guild):
             items = STATE["entries"].get(uid, [])
             total = sum(i[1] for i in items)
             name = mem.display_name.replace("`", "'")
-            lines = [f"📌 **{name}** • *{fmt_hm(total)}*"]
+            lines = [f"    **{name}** • *{fmt_hm(total)}*"]
             start = max(0, len(items) - keep) if keep else 0
             if start:
-                lines.append(f"\n>​        … {start} earlier")
+                lines.append(f"\n> >​        … {start} earlier")
             for i in range(start, len(items)):
                 task, mins = items[i]
-                lines.append(f"\n>​        {i + 1}. {escape_markdown(task)} — `{fmt_hm(mins)}`")
+                lines.append(f"\n> >​        {i + 1}. {escape_markdown(task)} — `{fmt_hm(mins)}`")
             blocks.append("".join(lines))
-        return header + ("\n\n".join(blocks) or "No students found.")
+        return header + ("\n\n".join(blocks) or "No students found.") + "\n\n━━━━━━━━━━━━━━━━━━━"
 
     text = build(None)
     for keep in (20, 12, 8, 5, 3, 1):  # shrink if it would exceed Discord's 2000-char limit
@@ -654,17 +654,27 @@ def has_media(m: discord.Message) -> bool:
 
 async def handle_media_channel(m: discord.Message):
     if has_media(m):
-        return
-    if "http" in m.content.lower():  # link previews (gifs etc.) take a moment to appear
-        await asyncio.sleep(3)
+        return  # Media or media with text is allowed
+
+    # Check if text-only message is a valid reply to a media message and user hasn't already replied to it
+    is_valid = False
+    if m.reference and m.reference.message_id:
         try:
-            m = await m.channel.fetch_message(m.id)
-        except discord.NotFound:
-            return
-        except discord.HTTPException:
+            ref_msg = await m.channel.fetch_message(m.reference.message_id)
+            if has_media(ref_msg):
+                already_replied = False
+                async for past_m in m.channel.history(limit=50):
+                    if past_m.id != m.id and past_m.author.id == m.author.id and past_m.reference and past_m.reference.message_id == ref_msg.id:
+                        already_replied = True
+                        break
+                if not already_replied:
+                    is_valid = True
+        except Exception:
             pass
-        if has_media(m):
-            return
+
+    if is_valid:
+        return
+
     try:
         await m.delete()
     except discord.Forbidden:
