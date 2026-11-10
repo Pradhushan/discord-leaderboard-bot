@@ -53,7 +53,7 @@ def now():
     return dt.datetime.now(TZ)
 
 def fresh_state(day: dt.date):
-    return {"day": day.isoformat(), "msg_id": None, "statuses": {}, "entries": {},
+    return {"day": day.isoformat(), "msg_id": None, "entries": {},
             "closed": False, "result": None, "posted": False}
 
 def fmt_hm(m): return f"{m // 60}hrs {m % 60}mins"      # progress message
@@ -109,12 +109,11 @@ Voice:
   These are only vocabulary hints. Use whatever fits naturally and don't force them in.
 - NEVER formal or textbook Sinhala. Never sound like a translation or a motivational poster.
 
-Data fields: "title" is the status the person set for the day (what they said they're doing).
+Data fields: "title" is empty.
 "topics" is the work they logged, each with its time.
 
 Content rules:
-- Every caption must reference something specific from that person's data: a topic, the hours,
-  or their status. No generic lines that could fit anyone.
+- Every caption must reference something specific from that person's data: a topic or the hours. No generic lines that could fit anyone.
 - passed=true: hype and respect. passed=false: light, friendly roast.
 - If minutes is 0 and topics is ["no post"], they logged nothing. Roast the silence.
 - Max ~12 words. End with exactly two emojis. No hashtags, no quotes, no asterisks or underscores.
@@ -188,7 +187,11 @@ def students(guild):
     return [m for m in role.members if m.id != ROLE_MODEL_ID and not m.bot]
 
 def render_progress(guild):
-    members = sorted(students(guild), key=lambda m: m.display_name.lower())
+    custom_order = ["★pedro★⋆˚꩜｡", "schrödinger's cat", "Dr. Novice"]
+    members = sorted(
+        students(guild),
+        key=lambda m: custom_order.index(m.display_name) if m.display_name in custom_order else 999
+    )
 
     def build(keep):
         blocks = []
@@ -196,16 +199,14 @@ def render_progress(guild):
             uid = str(mem.id)
             items = STATE["entries"].get(uid, [])
             total = sum(i[1] for i in items)
-            status = STATE["statuses"].get(uid)
             name = mem.display_name.replace("`", "'")
-            lines = [f"`{name}` ({fmt_hm(total)})",
-                     f'"{escape_markdown(status)}"' if status else '"no status yet"']
+            lines = [f"📌 `{name}` • `{fmt_hm(total)}`"]
             start = max(0, len(items) - keep) if keep else 0
             if start:
                 lines.append(f"  … {start} earlier")
             for i in range(start, len(items)):
                 task, mins = items[i]
-                lines.append(f"  {i + 1}. {escape_markdown(task)} ({fmt_hm(mins)})")
+                lines.append(f"  {i + 1}. {escape_markdown(task)} — `{fmt_hm(mins)}`")
             blocks.append("\n".join(lines))
         return "\n\n".join(blocks) or "No students found."
 
@@ -316,23 +317,6 @@ class Bot(discord.Client):
 bot = Bot()
 
 # ---------- COMMANDS ----------
-@bot.tree.command(name="status", description="Set what you're doing today (needed before /progress)")
-@app_commands.describe(text="e.g. grinding chemistry till late")
-@app_commands.guild_only()
-async def status_cmd(inter: discord.Interaction, text: app_commands.Range[str, 1, 80]):
-    await inter.response.defer(ephemeral=True)
-    async with guarded(inter):
-        if not await allowed(inter):
-            return
-        async with LOCK:
-            if not day_open():
-                await tell(inter, CLOSED_MSG, 20)
-                return
-            STATE["statuses"][str(inter.user.id)] = text.strip()
-            await save_state()
-            await refresh_progress(inter.guild)
-        await tell(inter, "✅ Status updated.", 10)
-
 @bot.tree.command(name="progress", description="Log what you studied")
 @app_commands.describe(task="What you studied", hours="Hours spent", minutes="Minutes spent")
 @app_commands.guild_only()
@@ -347,10 +331,6 @@ async def progress_cmd(inter: discord.Interaction, task: app_commands.Range[str,
         async with LOCK:
             if not day_open():
                 await tell(inter, CLOSED_MSG, 20)
-                return
-            if uid not in STATE["statuses"]:
-                await tell(inter, "⚠️ Set your status first with `/status` (for example: what you're doing today), "
-                                  "then log your progress. This message will disappear in a minute.", 60)
                 return
             if mins <= 0:
                 await tell(inter, "⚠️ Time must be more than 0 minutes.", 15)
@@ -415,7 +395,7 @@ async def compute_result(guild, day: dt.date):
         else:
             items = STATE["entries"].get(str(uid), [])
             mins = min(sum(i[1] for i in items), 1440)
-            title = STATE["statuses"].get(str(uid), "")
+            title = ""
             topics = [f"{t} ({fmt_short(m)})" for t, m in items] or ["no post"]
         rows.append({"uid": uid, "name": mem.display_name, "minutes": mins, "passed": mins >= BASELINE,
                      "title": title, "topics": topics,
