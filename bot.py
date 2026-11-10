@@ -288,8 +288,11 @@ intents.message_content = True
 
 class Bot(discord.Client):
     def __init__(self):
-        super().__init__(intents=intents)
+        super().__init__(intents=intents, status=discord.Status.idle)
         self.tree = app_commands.CommandTree(self)
+
+    async def on_ready(self):
+        await self.change_presence(status=discord.Status.idle)
 
     async def setup_hook(self):
         if os.environ.get("SYNC_COMMANDS", "1") == "1":  # set to 0 after commands appear
@@ -656,31 +659,51 @@ async def handle_media_channel(m: discord.Message):
     if has_media(m):
         return  # Media or media with text is allowed
 
-    # Check if text-only message is a valid reply to a media message and user hasn't already replied to it
     is_valid = False
-    if m.reference and m.reference.message_id:
-        try:
-            ref_msg = await m.channel.fetch_message(m.reference.message_id)
-            if has_media(ref_msg):
-                already_replied = False
-                async for past_m in m.channel.history(limit=50):
-                    if past_m.id != m.id and past_m.author.id == m.author.id and past_m.reference and past_m.reference.message_id == ref_msg.id:
-                        already_replied = True
-                        break
-                if not already_replied:
-                    is_valid = True
-        except Exception:
-            pass
+    try:
+        target_media_msg = None
+        
+        # 1. Check if it's an explicit reply to a media message
+        if m.reference and m.reference.message_id:
+            try:
+                ref_msg = await m.channel.fetch_message(m.reference.message_id)
+                if has_media(ref_msg):
+                    target_media_msg = ref_msg
+            except Exception:
+                pass
+        
+        # 2. If not an explicit reply, look at recent history for the preceding media message
+        if not target_media_msg:
+            async for past_m in m.channel.history(limit=5, before=m):
+                if has_media(past_m):
+                    target_media_msg = past_m
+                    break
+                if not has_media(past_m):
+                    break # Interrupted by another text message
+
+        if target_media_msg:
+            # Check if this user has already sent a message for this specific media message
+            already_sent = False
+            async def check_replies():
+                nonlocal already_sent
+                async for past_m in m.channel.history(limit=30, before=m):
+                    if past_m.author.id == m.author.id:
+                        if past_m.reference and past_m.reference.message_id == target_media_msg.id:
+                            already_sent = True
+                            break
+            await check_replies()
+            
+            if not already_sent:
+                is_valid = True
+    except Exception as ex:
+        traceback.print_exc()
 
     if is_valid:
         return
 
     try:
         await m.delete()
-    except discord.Forbidden:
-        print("Missing 'Manage Messages' permission in the media channel.", flush=True)
-        return
-    except discord.NotFound:
+    except Exception:
         pass
 
 # ---------- START ----------
