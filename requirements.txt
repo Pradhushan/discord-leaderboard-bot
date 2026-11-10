@@ -1,5 +1,5 @@
 discord.py>=2.4
 google-genai
 aiohttp
-Pillow>=10.0.0
+playwright==1.49.0
 tzdata
