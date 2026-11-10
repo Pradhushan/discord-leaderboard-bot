@@ -288,11 +288,11 @@ intents.message_content = True
 
 class Bot(discord.Client):
     def __init__(self):
-        super().__init__(intents=intents, status=discord.Status.idle)
+        super().__init__(intents=intents, status=discord.Status.dnd)
         self.tree = app_commands.CommandTree(self)
 
     async def on_ready(self):
-        await self.change_presence(status=discord.Status.idle)
+        await self.change_presence(status=discord.Status.dnd)
 
     async def setup_hook(self):
         if os.environ.get("SYNC_COMMANDS", "1") == "1":  # set to 0 after commands appear
