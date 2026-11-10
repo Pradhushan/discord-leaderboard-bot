@@ -9,7 +9,7 @@ from discord.utils import escape_markdown
 from aiohttp import web
 from google import genai
 from google.genai import types
-from playwright.async_api import async_playwright
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # ---------- CONFIG ----------
 TZ = ZoneInfo("Asia/Colombo")
@@ -33,7 +33,7 @@ NO_MENTIONS = discord.AllowedMentions.none()
 
 STATE = {}
 LOCK = asyncio.Lock()         # protects STATE
-RENDER_LOCK = asyncio.Lock()  # only one Chromium at a time
+RENDER_LOCK = asyncio.Lock()  # renderer concurrency lock
 last_data_msg = None
 last_tick = 0.0
 _post_fails = 0
@@ -206,10 +206,10 @@ def render_progress(guild):
             lines = [f"    **{name}** • *{fmt_hm(total)}*"]
             start = max(0, len(items) - keep) if keep else 0
             if start:
-                lines.append(f"\n> >​        … {start} earlier")
+                lines.append(f"\n> >\u200b        … {start} earlier")
             for i in range(start, len(items)):
                 task, mins = items[i]
-                lines.append(f"\n> >​        {i + 1}. {escape_markdown(task)} — `{fmt_hm(mins)}`")
+                lines.append(f"\n> >\u200b        {i + 1}. {escape_markdown(task)} — `{fmt_hm(mins)}`")
             blocks.append("".join(lines))
         return header + ("\n\n".join(blocks) or "No students found.") + "\n\n━━━━━━━━━━━━━━━━━━━"
 
@@ -433,75 +433,125 @@ def result_text(result):
     lines += ["", f"_*{fmt_short(BASELINE)} baseline. {len(passed)} passed, {len(failed)} failed.*_"]
     return "\n".join(lines)
 
-BG_SVG = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='60' height='60' viewBox='0 0 60 60'><path d='M-15,45 L45,-15 M0,60 L60,0 M15,75 L75,15' stroke='%23ff2a2a' stroke-width='1.2' opacity='0.12'/><circle cx='30' cy='30' r='1.5' fill='%23ff2a2a' opacity='0.3'/></svg>"
-PLACEHOLDER = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='76' height='76'><rect width='76' height='76' fill='%23444'/></svg>"
-RANK_C = ["#ffca28", "#e0e0e0", "#cd7f32", "#ff5252", "#ff5252"]
-NAME_C = ["#ffca28", "#ffffff", "#cd7f32", "#ff5252", "#ff5252"]
+# ---------- LIGHTWEIGHT PIL LEADERBOARD RENDERER ----------
+RANK_COLORS_RGB = [(255, 202, 40), (224, 224, 224), (205, 127, 50), (255, 82, 82), (255, 82, 82)]
+NAME_COLORS_RGB = [(255, 202, 40), (255, 255, 255), (205, 127, 50), (255, 82, 82), (255, 82, 82)]
 
-HEAD = """<!DOCTYPE html><html><head><meta charset="utf-8"><style>
-@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Anonymous+Pro:wght@400;700&display=swap');
-body{margin:0;padding:0;background:#121212}
-#capture-area{width:1080px;height:1080px;background-color:#141414;
-background-image:radial-gradient(circle at 50% 45%,rgba(255,42,42,0.09) 0%,rgba(18,18,18,0.95) 70%),url("__BG__");
-background-repeat:no-repeat,repeat;color:white;font-family:'Anonymous Pro',monospace;box-sizing:border-box;
-display:flex;flex-direction:column;align-items:center;justify-content:center;gap:50px;padding:40px 0;position:relative}
-.header{text-align:center;display:flex;flex-direction:column;align-items:center}
-.title-main{font-family:'Orbitron',sans-serif;color:#ff2a2a;font-size:58px;letter-spacing:8px;margin:0;font-weight:900;
-text-shadow:0 0 25px rgba(255,42,42,0.75),0 0 10px rgba(255,42,42,0.5)}
-.title-sub{font-family:'Orbitron',sans-serif;color:#ffca28;font-size:36px;letter-spacing:12px;margin:4px 0 0 0;font-weight:700;
-text-shadow:0 0 15px rgba(255,202,40,0.5)}
-.leaderboard-container{display:flex;flex-direction:column;gap:20px;width:820px}
-.card{background:rgba(26,26,26,0.95);border-radius:35px;padding:0 45px;height:110px;display:flex;align-items:center;
-border:1px solid rgba(255,42,42,0.35);box-shadow:0 0 25px 4px rgba(255,42,42,0.18);box-sizing:border-box}
-.rank{font-size:36px;font-weight:700;width:90px;letter-spacing:1px}
-.profile-pic{width:76px;height:76px;border-radius:50%;object-fit:cover;margin-right:35px;border:none}
-.name{font-size:32px;font-weight:700;letter-spacing:3px;flex-grow:1;overflow:hidden;white-space:nowrap}
-.time{font-size:32px;font-weight:700;color:#ffca28;letter-spacing:2px}
-.empty{font-size:30px;font-weight:700;letter-spacing:3px;color:#ff5252;justify-content:center}
-.footer{font-family:'Orbitron',sans-serif;font-size:24px;letter-spacing:8px;color:#fff;font-weight:700;
-text-shadow:0 0 10px rgba(255,255,255,0.5)}
-</style></head><body><div id="capture-area">
-<div class="header"><h1 class="title-main">THE GRIND</h1><h2 class="title-sub">LEADERBOARD</h2></div>
-<div class="leaderboard-container">""".replace("__BG__", BG_SVG)
-
-BROWSER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-                "--disable-extensions", "--disable-background-networking"]
-
-async def avatar_uri(session, url):
+def load_font(size, bold=False):
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-            data = await r.read()
-            ctype = r.headers.get("Content-Type", "image/png")
-        return f"data:{ctype};base64," + base64.b64encode(data).decode()
+        return ImageFont.truetype(font_path, size)
     except Exception:
-        return PLACEHOLDER
+        return ImageFont.load_default()
+
+async def fetch_avatar_image(session, url):
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.read()
+            img = Image.open(io.BytesIO(data)).convert("RGBA")
+            img = img.resize((76, 76), Image.Resampling.LANCZOS)
+            mask = Image.new("L", (76, 76), 0)
+            draw = ImageDraw.Draw(mask)
+            draw.ellipse((0, 0, 76, 76), fill=255)
+            output = Image.new("RGBA", (76, 76), (0, 0, 0, 0))
+            output.paste(img, (0, 0), mask)
+            return output
+    except Exception:
+        placeholder = Image.new("RGBA", (76, 76), (68, 68, 68, 255))
+        mask = Image.new("L", (76, 76), 0)
+        draw = ImageDraw.Draw(mask)
+        draw.ellipse((0, 0, 76, 76), fill=255)
+        output = Image.new("RGBA", (76, 76), (0, 0, 0, 0))
+        output.paste(placeholder, (0, 0), mask)
+        return output
 
 async def render(passed_rows, days_left: int) -> bytes:
-    cards = ""
+    W, H = 1080, 1080
+    bg = Image.new("RGBA", (W, H), (20, 20, 20, 255))
+    
+    # Glow overlay
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    glow_draw = ImageDraw.Draw(glow)
+    center_x, center_y = 540, 486
+    max_radius = 500
+    for r in range(max_radius, 0, -5):
+        alpha = int(22 * (1 - r / max_radius))
+        glow_draw.ellipse([center_x - r, center_y - r, center_x + r, center_y + r], fill=(255, 42, 42, alpha))
+    bg = Image.alpha_composite(bg, glow)
+
+    draw = ImageDraw.Draw(bg)
+
+    # Grid background pattern
+    grid = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    g_draw = ImageDraw.Draw(grid)
+    for x in range(-500, W + 500, 60):
+        g_draw.line([(x, -500), (x + H + 1000, H + 500)], fill=(255, 42, 42, 30), width=1)
+    bg = Image.alpha_composite(bg, grid)
+    draw = ImageDraw.Draw(bg)
+
+    # Fonts
+    font_title = load_font(52, bold=True)
+    font_sub = load_font(32, bold=True)
+    font_card = load_font(28, bold=True)
+    font_footer = load_font(22, bold=True)
+
+    # Header
+    draw.text((540, 100), "THE GRIND", font=font_title, fill=(255, 42, 42, 255), anchor="mm")
+    draw.text((540, 155), "LEADERBOARD", font=font_sub, fill=(255, 202, 40, 255), anchor="mm")
+
+    # Fetch Avatars
+    avatars = []
     async with aiohttp.ClientSession() as session:
-        for i, r in enumerate(passed_rows[:5]):  # image: only baseline-clearers, max 5
-            av = await avatar_uri(session, r["avatar"])
+        for r in passed_rows[:5]:
+            av = await fetch_avatar_image(session, r["avatar"])
+            avatars.append(av)
+
+    container_x = (W - 820) // 2
+    start_y = 220
+    card_h = 110
+    gap = 20
+
+    rows_to_render = passed_rows[:5]
+    if rows_to_render:
+        for i, r in enumerate(rows_to_render):
+            y = start_y + i * (card_h + gap)
+            card_box = [container_x, y, container_x + 820, y + card_h]
+            
+            # Draw Card Background & Glow
+            draw.rounded_rectangle(card_box, radius=35, fill=(26, 26, 26, 242), outline=(255, 42, 42, 90), width=1)
+
+            # Rank
+            rank_str = f"#{i+1}"
+            rank_col = RANK_COLORS_RGB[i] if i < len(RANK_COLORS_RGB) else (255, 82, 82)
+            draw.text((container_x + 45, y + 55), rank_str, font=font_card, fill=rank_col, anchor="lm")
+
+            # Profile Pic
+            if i < len(avatars):
+                bg.paste(avatars[i], (container_x + 130, y + 17), avatars[i])
+
+            # Name
+            name_str = r["name"].upper()
+            if len(name_str) > 16:
+                name_str = name_str[:15] + "…"
+            name_col = NAME_COLORS_RGB[i] if i < len(NAME_COLORS_RGB) else (255, 255, 255)
+            draw.text((container_x + 235, y + 55), name_str, font=font_card, fill=name_col, anchor="lm")
+
+            # Time
             h, m = divmod(r["minutes"], 60)
-            cards += (f'<div class="card"><div class="rank" style="color:{RANK_C[i]}">#{i+1}</div>'
-                      f'<img class="profile-pic" src="{av}" alt="">'
-                      f'<div class="name" style="color:{NAME_C[i]}">{htmllib.escape(r["name"].upper())}</div>'
-                      f'<div class="time">{h:02d}H {m:02d}M</div></div>')
-    if not cards:
-        cards = '<div class="card empty">NOBODY CLEARED THE BASELINE 💀</div>'
-    page = HEAD + cards + f'</div><div class="footer">{days_left} DAYS MORE!</div></div></body></html>'
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(args=BROWSER_ARGS)
-        try:
-            pg = await browser.new_page(viewport={"width": 1080, "height": 1080})
-            await pg.set_content(page, wait_until="load", timeout=30000)
-            try:
-                await asyncio.wait_for(pg.evaluate("document.fonts.ready"), timeout=10)
-            except Exception:
-                pass
-            png = await pg.locator("#capture-area").screenshot()
-        finally:
-            await browser.close()
-    return png
+            time_str = f"{h:02d}H {m:02d}M"
+            draw.text((container_x + 775, y + 55), time_str, font=font_card, fill=(255, 202, 40, 255), anchor="rm")
+    else:
+        # Empty state card
+        card_box = [container_x, start_y + 100, container_x + 820, start_y + 100 + card_h]
+        draw.rounded_rectangle(card_box, radius=35, fill=(26, 26, 26, 242), outline=(255, 42, 42, 90), width=1)
+        draw.text((540, start_y + 100 + 55), "NOBODY CLEARED THE BASELINE 💀", font=font_card, fill=(255, 82, 82, 255), anchor="mm")
+
+    # Footer
+    draw.text((540, 1000), f"{days_left} DAYS MORE!", font=font_footer, fill=(255, 255, 255, 255), anchor="mm")
+
+    output = io.BytesIO()
+    bg.convert("RGB").save(output, format="PNG")
+    return output.getvalue()
 
 async def post_result(guild, result, prefix: str = "", track=False):
     """Posts image first, captions after. With track=True, a retry never reposts what already went out."""
@@ -684,14 +734,11 @@ async def handle_media_channel(m: discord.Message):
         if target_media_msg:
             # Check if this user has already sent a message for this specific media message
             already_sent = False
-            async def check_replies():
-                nonlocal already_sent
-                async for past_m in m.channel.history(limit=30, before=m):
-                    if past_m.author.id == m.author.id:
-                        if past_m.reference and past_m.reference.message_id == target_media_msg.id:
-                            already_sent = True
-                            break
-            await check_replies()
+            async for past_m in m.channel.history(limit=30, before=m):
+                if past_m.author.id == m.author.id and past_m.id != m.id:
+                    if past_m.reference and past_m.reference.message_id == target_media_msg.id:
+                        already_sent = True
+                        break
             
             if not already_sent:
                 is_valid = True
