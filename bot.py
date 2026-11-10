@@ -206,10 +206,10 @@ def render_progress(guild):
             lines = [f"📌 **{name}** • *{fmt_hm(total)}*"]
             start = max(0, len(items) - keep) if keep else 0
             if start:
-                lines.append(f"\n            … {start} earlier")
+                lines.append(f"\n>​        … {start} earlier")
             for i in range(start, len(items)):
                 task, mins = items[i]
-                lines.append(f"\n            {i + 1}. {escape_markdown(task)} — `{fmt_hm(mins)}`")
+                lines.append(f"\n>​        {i + 1}. {escape_markdown(task)} — `{fmt_hm(mins)}`")
             blocks.append("".join(lines))
         return header + ("\n\n".join(blocks) or "No students found.")
 
@@ -672,16 +672,6 @@ async def handle_media_channel(m: discord.Message):
         return
     except discord.NotFound:
         pass
-    warn = (f"📸 {m.channel.mention} only allows photos or videos (a caption with them is fine). "
-            "Text-only messages aren't allowed, so I removed yours. This message disappears in a minute.")
-    try:
-        await m.author.send(warn, delete_after=60)
-    except (discord.Forbidden, discord.HTTPException):
-        try:  # DMs closed: short public notice instead
-            await m.channel.send(f"{m.author.mention} only photos or videos here (captions are fine) 📸",
-                                 delete_after=15, allowed_mentions=discord.AllowedMentions(users=[m.author]))
-        except discord.HTTPException:
-            pass
 
 # ---------- START ----------
 try:
