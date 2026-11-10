@@ -1,4 +1,4 @@
-import os, io, sys, json, time, base64, asyncio, random, traceback, pathlib, html as htmllib
+import os, io, sys, json, time, base64, asyncio, random, traceback, html as htmllib
 import datetime as dt
 from zoneinfo import ZoneInfo
 
@@ -39,7 +39,6 @@ last_tick = 0.0
 _post_fails = 0
 backoff_until = 0.0           # when Discord blocks us (429), the scheduler waits until this time
 POST_PROGRESS = {"img": False, "parts": 0}  # so a retry never reposts what was already sent
-PRERENDER = {"png": None, "day": None}      # image rendered at 23:55, uploaded at 00:01
 BG_TASKS = set()
 
 def spawn(coro):
@@ -409,9 +408,7 @@ async def compute_result(guild, day: dt.date):
                      "avatar": str(mem.display_avatar.replace(size=128, format="png").url)})
     rows.sort(key=lambda r: -r["minutes"])
 
-    _t = time.time()
     caps = await write_captions(rows)
-    print(f"⏱ captions (Gemini): {time.time()-_t:.1f}s", flush=True)
     for r in rows:
         r["caption"] = ROLE_MODEL_CAPTION if r["uid"] == ROLE_MODEL_ID \
             else clean_caption(caps.get(r["uid"], "📝⚡"))
@@ -441,8 +438,6 @@ PLACEHOLDER = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' w
 RANK_C = ["#ffca28", "#e0e0e0", "#cd7f32", "#ff5252", "#ff5252"]
 NAME_C = ["#ffca28", "#ffffff", "#cd7f32", "#ff5252", "#ff5252"]
 
-GOOGLE_IMPORT = "@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Anonymous+Pro:wght@400;700&display=swap');"
-
 HEAD = """<!DOCTYPE html><html><head><meta charset="utf-8"><style>
 @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Anonymous+Pro:wght@400;700&display=swap');
 body{margin:0;padding:0;background:#121212}
@@ -469,53 +464,8 @@ text-shadow:0 0 10px rgba(255,255,255,0.5)}
 <div class="header"><h1 class="title-main">THE GRIND</h1><h2 class="title-sub">LEADERBOARD</h2></div>
 <div class="leaderboard-container">""".replace("__BG__", BG_SVG)
 
-# ---- Embedded fonts: no download from Google, so rendering is faster and never falls back ----
-FONT_DIR = pathlib.Path(__file__).parent / "fonts"
-
-def _find(*names):
-    for n in names:
-        p = FONT_DIR / n
-        if p.exists():
-            return p
-    return None
-
-def _face(family, path, weight):
-    b64 = base64.b64encode(path.read_bytes()).decode()
-    return (f"@font-face{{font-family:'{family}';font-weight:{weight};font-style:normal;"
-            f"src:url(data:font/ttf;base64,{b64}) format('truetype');}}")
-
-def build_font_css():
-    faces = []
-    orb_var = _find("Orbitron-VariableFont_wght.ttf", "Orbitron[wght].ttf")
-    if orb_var:
-        faces.append(_face("Orbitron", orb_var, "400 900"))
-    else:
-        orb_b = _find("Orbitron-Bold.ttf")
-        orb_k = _find("Orbitron-Black.ttf")
-        if not (orb_b and orb_k):
-            return ""
-        faces += [_face("Orbitron", orb_b, "700"), _face("Orbitron", orb_k, "900")]
-    ap_r = _find("AnonymousPro-Regular.ttf", "Anonymous_Pro-Regular.ttf")
-    ap_b = _find("AnonymousPro-Bold.ttf", "Anonymous_Pro-Bold.ttf")
-    if not (ap_r and ap_b):
-        return ""
-    faces += [_face("Anonymous Pro", ap_r, "400"), _face("Anonymous Pro", ap_b, "700")]
-    return "".join(faces)
-
-try:
-    FONT_CSS = build_font_css()
-except Exception:
-    traceback.print_exc()
-    FONT_CSS = ""
-if FONT_CSS:
-    HEAD = HEAD.replace(GOOGLE_IMPORT, FONT_CSS)
-print(f"Fonts: {'embedded from /fonts' if FONT_CSS else 'Google (network)'}", flush=True)
-
 BROWSER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-                "--disable-extensions", "--disable-background-networking",
-                "--renderer-process-limit=1", "--no-zygote",
-                "--disable-features=site-per-process,TranslateUI",
-                "--js-flags=--max-old-space-size=128"]
+                "--disable-extensions", "--disable-background-networking"]
 
 async def avatar_uri(session, url):
     try:
@@ -527,7 +477,6 @@ async def avatar_uri(session, url):
         return PLACEHOLDER
 
 async def render(passed_rows, days_left: int) -> bytes:
-    t0 = time.time()
     cards = ""
     async with aiohttp.ClientSession() as session:
         for i, r in enumerate(passed_rows[:5]):  # image: only baseline-clearers, max 5
@@ -539,29 +488,19 @@ async def render(passed_rows, days_left: int) -> bytes:
                       f'<div class="time">{h:02d}H {m:02d}M</div></div>')
     if not cards:
         cards = '<div class="card empty">NOBODY CLEARED THE BASELINE 💀</div>'
-    print(f"⏱ avatars: {time.time()-t0:.1f}s", flush=True)
     page = HEAD + cards + f'</div><div class="footer">{days_left} DAYS MORE!</div></div></body></html>'
     async with async_playwright() as p:
-        t1 = time.time()
         browser = await p.chromium.launch(args=BROWSER_ARGS)
-        print(f"⏱ chromium launch: {time.time()-t1:.1f}s", flush=True)
         try:
             pg = await browser.new_page(viewport={"width": 1080, "height": 1080})
-            t2 = time.time()
             await pg.set_content(page, wait_until="load", timeout=30000)
-            print(f"⏱ page load: {time.time()-t2:.1f}s", flush=True)
-            t3 = time.time()
             try:
                 await asyncio.wait_for(pg.evaluate("document.fonts.ready"), timeout=10)
             except Exception:
                 pass
-            print(f"⏱ fonts: {time.time()-t3:.1f}s", flush=True)
-            t4 = time.time()
             png = await pg.locator("#capture-area").screenshot()
-            print(f"⏱ screenshot: {time.time()-t4:.1f}s", flush=True)
         finally:
             await browser.close()
-    print(f"⏱ render total: {time.time()-t0:.1f}s", flush=True)
     return png
 
 async def post_result(guild, result, prefix: str = "", track=False):
@@ -569,13 +508,10 @@ async def post_result(guild, result, prefix: str = "", track=False):
     ch = await get_ch(PROGRESS_CH)
     if not (track and POST_PROGRESS["img"]):
         png = None
-        if track and PRERENDER.get("day") == result["day"]:
-            png = PRERENDER["png"]  # already rendered at 23:55
-        if png is None:
-            try:
-                png = await render([r for r in result["rows"] if r["passed"]], result["days_left"])
-            except Exception:
-                traceback.print_exc()
+        try:
+            png = await render([r for r in result["rows"] if r["passed"]], result["days_left"])
+        except Exception:
+            traceback.print_exc()
         if png:
             await ch.send(content=prefix or None, file=discord.File(io.BytesIO(png), "leaderboard.png"))
         else:
@@ -628,18 +564,12 @@ async def tick():
             STATE["closed"] = True
             await save_state()
 
-    # 2) work out the results (AI captions) and pre-render the image
+    # 2) work out the results (AI captions)
     if STATE["closed"] and STATE["result"] is None:
         result = await compute_result(guild, day)
         async with LOCK:
             STATE["result"] = result
             await save_state()
-        try:
-            async with RENDER_LOCK:
-                PRERENDER["png"] = await render([r for r in result["rows"] if r["passed"]], result["days_left"])
-                PRERENDER["day"] = result["day"]
-        except Exception:
-            traceback.print_exc()  # fine: post_result will render it itself later
 
     # 3) post at 00:01
     if STATE["result"] and not STATE["posted"]:
@@ -651,7 +581,6 @@ async def tick():
             except Exception as ex:
                 traceback.print_exc()
                 if is_429(ex):
-                    print("⚠️ Discord 429: waiting 10 min before retrying", flush=True)
                     backoff_until = time.time() + 600  # blocked: wait 10 min, keep trying (never give up)
                     return
                 _post_fails += 1
@@ -665,7 +594,6 @@ async def tick():
                     pass
             _post_fails = 0
             POST_PROGRESS.update(img=False, parts=0)
-            PRERENDER.update(png=None, day=None)
             async with LOCK:
                 STATE["posted"] = True
                 await save_state()
@@ -680,7 +608,6 @@ async def scheduler():
         except Exception as ex:
             traceback.print_exc()
             if is_429(ex):
-                print("⚠️ Discord 429: waiting 10 min before retrying", flush=True)
                 backoff_until = time.time() + 600
         await asyncio.sleep(20)
 
@@ -728,56 +655,70 @@ def has_media(m: discord.Message) -> bool:
             return True
     return any(e.type in ("image", "video", "gifv") for e in m.embeds)
 
+MEDIA_LOCK = asyncio.Lock()  # handle one message at a time so two quick texts can't both slip through
+
 async def handle_media_channel(m: discord.Message):
     if has_media(m):
-        return  # Media or media with text is allowed
+        return  # media, or media with a caption, is always allowed
 
-    is_valid = False
-    try:
-        target_media_msg = None
-        
-        # 1. Check if it's an explicit reply to a media message
-        if m.reference and m.reference.message_id:
-            try:
-                ref_msg = await m.channel.fetch_message(m.reference.message_id)
-                if has_media(ref_msg):
-                    target_media_msg = ref_msg
-            except Exception:
-                pass
-        
-        # 2. If not an explicit reply, look at recent history for the preceding media message
-        if not target_media_msg:
-            async for past_m in m.channel.history(limit=5, before=m):
-                if has_media(past_m):
-                    target_media_msg = past_m
-                    break
-                if not has_media(past_m):
-                    break # Interrupted by another text message
+    if "http" in m.content.lower():  # give link previews (gifs etc.) a moment to load
+        await asyncio.sleep(3)
+        try:
+            m = await m.channel.fetch_message(m.id)
+        except discord.NotFound:
+            return
+        except discord.HTTPException:
+            pass
+        if has_media(m):
+            return
 
-        if target_media_msg:
-            # Check if this user has already sent a message for this specific media message
-            already_sent = False
-            async def check_replies():
-                nonlocal already_sent
-                async for past_m in m.channel.history(limit=30, before=m):
-                    if past_m.author.id == m.author.id:
-                        if past_m.reference and past_m.reference.message_id == target_media_msg.id:
-                            already_sent = True
+    async with MEDIA_LOCK:
+        valid = False
+        try:
+            target, explicit = None, False
+
+            # 1. Explicit reply to a media message -> that media is the target
+            if m.reference and m.reference.message_id:
+                try:
+                    ref = await m.channel.fetch_message(m.reference.message_id)
+                    if has_media(ref):
+                        target, explicit = ref, True
+                except Exception:
+                    pass
+
+            # 2. Otherwise the target is the closest media message above this one
+            #    (texts from other people in between are ignored)
+            if target is None:
+                async for past in m.channel.history(limit=50, before=m):
+                    if has_media(past):
+                        target = past
+                        break
+
+            # 3. Allowed only if this user has no text under that media yet
+            if target is not None:
+                already = False
+                async for past in m.channel.history(limit=100, after=target, before=m):
+                    if past.author.id != m.author.id or has_media(past):
+                        continue
+                    ref_id = past.reference.message_id if past.reference else None
+                    if explicit:
+                        if ref_id == target.id:
+                            already = True
                             break
-            await check_replies()
-            
-            if not already_sent:
-                is_valid = True
-    except Exception as ex:
-        traceback.print_exc()
+                    elif ref_id is None or ref_id == target.id:
+                        already = True
+                        break
+                valid = not already
+        except Exception:
+            traceback.print_exc()
+            return  # if Discord errors out, leave the message alone instead of deleting it
 
-    if is_valid:
-        return
-
-    try:
-        await m.delete()
-    except Exception:
-        pass
+        if valid:
+            return
+        try:
+            await m.delete()
+        except Exception:
+            pass
 
 # ---------- START ----------
 try:

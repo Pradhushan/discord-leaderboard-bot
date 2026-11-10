@@ -3,5 +3,5 @@ RUN apt-get update && apt-get install -y fonts-noto-core fonts-noto-color-emoji 
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
+COPY bot.py .
 CMD ["python", "bot.py"]
