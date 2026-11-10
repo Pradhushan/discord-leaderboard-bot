@@ -300,12 +300,6 @@ class Bot(discord.Client):
             self.tree.copy_global_to(guild=g)
             await self.tree.sync(guild=g)
         await load_state()
-        app = web.Application()
-        app.router.add_get("/", lambda r: web.Response(text="ok"))
-        app.router.add_get("/health", health)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
         spawn(scheduler())
         spawn(watchdog())
         spawn(keepalive())
@@ -721,9 +715,20 @@ async def handle_media_channel(m: discord.Message):
             pass
 
 # ---------- START ----------
-try:
-    bot.run(TOKEN)
-except discord.HTTPException as ex:
-    print(f"Discord login failed ({ex.status}).", flush=True)
-    time.sleep(900 if ex.status == 429 else 30)  # space out restarts so we don't hammer Discord
-    sys.exit(1)
+async def main():
+    # open the web port first so Render sees the service as healthy even if Discord blocks login
+    app = web.Application()
+    app.router.add_get("/", lambda r: web.Response(text="ok"))
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
+    try:
+        await bot.start(TOKEN)
+    except discord.HTTPException as ex:
+        print(f"Discord login failed ({ex.status}). Waiting before a fresh restart.", flush=True)
+        await asyncio.sleep(1800 if ex.status == 429 else 30)  # wait quietly, then restart once
+        os._exit(1)
+
+discord.utils.setup_logging()
+asyncio.run(main())
