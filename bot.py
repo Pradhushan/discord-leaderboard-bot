@@ -211,7 +211,7 @@ def render_progress(guild):
                 task, mins = items[i]
                 lines.append(f"\n> >​        {i + 1}. {escape_markdown(task)} — `{fmt_hm(mins)}`")
             blocks.append("".join(lines))
-        return header + ("\n\n".join(blocks) or "No students found.") + "\n\n━━━━━━━━━━━━━━━━━━━"
+        return header + ("\n\n".join(blocks) or "No students found.") + "\n\n"
 
     text = build(None)
     for keep in (20, 12, 8, 5, 3, 1):  # shrink if it would exceed Discord's 2000-char limit
