@@ -193,11 +193,11 @@ def students(guild):
     return [m for m in role.members if m.id != ROLE_MODEL_ID and not m.bot]
 
 def render_progress(guild):
-    custom_order = ["★pedro★⋆˚꩜｡", "schrödinger's cat", "Dr. Novice"]
-    members = sorted(
-        students(guild),
-        key=lambda m: custom_order.index(m.display_name) if m.display_name in custom_order else 999
-    )
+    def sort_key(m):
+        total = sum(i[1] for i in STATE["entries"].get(str(m.id), []))
+        return (total, m.id)  # least time on top, most at the bottom; ID only breaks ties
+
+    members = sorted(students(guild), key=sort_key)
 
     day = dt.date.fromisoformat(STATE["day"])
     header = f"*__Progress\nDate: {ordinal(day.day)} {day.strftime('%b %Y')}__*\n\n"
