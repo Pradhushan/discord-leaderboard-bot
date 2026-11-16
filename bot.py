@@ -24,11 +24,12 @@ ROLE_MODEL_MIN = 600
 ROLE_MODEL_CAPTION = "Catch me if u can! 🏎️💨"
 BASELINE = int(os.environ.get("BASELINE_MINUTES", "240"))
 EXAM_DATE = dt.date.fromisoformat(os.environ.get("EXAM_DATE", "2027-08-03"))
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 FALLBACKS = [m.strip() for m in os.environ.get("GEMINI_FALLBACKS", "").split(",") if m.strip()]
-RETRY_DELAYS = [2, 5, 10, 20]
+RETRY_DELAYS = [3]  # one quick retry per model, then move on to the next model
 REPOST = os.environ.get("REPOST_ON_UPDATE", "0") == "1"
-ai = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+ai = genai.Client(api_key=os.environ["GEMINI_API_KEY"],
+                  http_options=types.HttpOptions(timeout=30000))  # 30s per request, in milliseconds
 NO_MENTIONS = discord.AllowedMentions.none()
 
 STATE = {}
@@ -54,7 +55,8 @@ def now():
 
 def fresh_state(day: dt.date):
     return {"day": day.isoformat(), "msg_id": None, "entries": {},
-            "closed": False, "result": None, "posted": False}
+            "closed": False, "result": None, "posted": False,
+            "pens_bag": [], "pens_last": None}
 
 def fmt_hm(m): return f"{m // 60}hrs {m % 60}mins"      # progress message
 def fmt(m): return f"{m // 60:02d}h {m % 60:02d}m"       # leaderboard
@@ -88,7 +90,11 @@ async def ask_json(prompt: str, temperature: float):
                 )
                 return json.loads(r.text)
             try:
-                return await asyncio.to_thread(call)
+                return await asyncio.wait_for(asyncio.to_thread(call), timeout=40)
+            except asyncio.TimeoutError as ex:
+                last_err = ex
+                print(f"⚠️ {model} timed out, trying next model", flush=True)
+                break
             except Exception as ex:
                 last_err = ex
                 msg = str(ex)
@@ -381,6 +387,22 @@ async def testnow(inter: discord.Interaction):
             await post_result(inter.guild, result, prefix="🧪 **TEST RUN**")
         await tell(inter, f"✅ Posted in <#{PROGRESS_CH}>", 15)
 
+@bot.tree.command(name="say", description="Send a message as the bot")
+@app_commands.describe(message="What the bot should say",
+                       channel="Where to send it (default: the progress channel)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def say_cmd(inter: discord.Interaction, message: app_commands.Range[str, 1, 2000],
+                  channel: discord.TextChannel | None = None):
+    await inter.response.defer(ephemeral=True)
+    async with guarded(inter):
+        if not inter.user.guild_permissions.administrator:
+            await tell(inter, "⚠️ Only admins can use this.", 10)
+            return
+        target = channel or await get_ch(PROGRESS_CH)
+        await target.send(message, allowed_mentions=NO_MENTIONS)
+        await tell(inter, f"✅ Sent in {target.mention}", 10)
+
 # ---------- LEADERBOARD ----------
 async def compute_result(guild, day: dt.date):
     role = guild.get_role(STUDENT_ROLE)
@@ -402,7 +424,11 @@ async def compute_result(guild, day: dt.date):
                      "avatar": str(mem.display_avatar.replace(size=128, format="png").url)})
     rows.sort(key=lambda r: -r["minutes"])
 
-    caps = await write_captions(rows)
+    try:
+        caps = await asyncio.wait_for(write_captions(rows), timeout=120)  # captions can never block the board
+    except Exception:
+        traceback.print_exc()
+        caps = {}  # the leaderboard still posts, with the 📝⚡ fallback caption
     for r in rows:
         r["caption"] = ROLE_MODEL_CAPTION if r["uid"] == ROLE_MODEL_ID \
             else clean_caption(caps.get(r["uid"], "📝⚡"))
@@ -427,7 +453,8 @@ def result_text(result):
     lines += ["", f"_*{fmt_short(BASELINE)} baseline. {len(passed)} passed, {len(failed)} failed.*_"]
     return "\n".join(lines)
 
-BG_SVG = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='60' height='60' viewBox='0 0 60 60'><path d='M-15,45 L45,-15 M0,60 L60,0 M15,75 L75,15' stroke='%23ff2a2a' stroke-width='1.2' opacity='0.12'/><circle cx='30' cy='30' r='1.5' fill='%23ff2a2a' opacity='0.3'/></svg>"
+# ice blue (#8fe3ff) replaces red in the pattern, glow, title and card outlines
+BG_SVG = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='60' height='60' viewBox='0 0 60 60'><path d='M-15,45 L45,-15 M0,60 L60,0 M15,75 L75,15' stroke='%238fe3ff' stroke-width='1.2' opacity='0.12'/><circle cx='30' cy='30' r='1.5' fill='%238fe3ff' opacity='0.3'/></svg>"
 PLACEHOLDER = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='76' height='76'><rect width='76' height='76' fill='%23444'/></svg>"
 RANK_C = ["#ffca28", "#e0e0e0", "#cd7f32", "#ff5252", "#ff5252"]
 NAME_C = ["#ffca28", "#ffffff", "#cd7f32", "#ff5252", "#ff5252"]
@@ -436,17 +463,17 @@ HEAD = """<!DOCTYPE html><html><head><meta charset="utf-8"><style>
 @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Anonymous+Pro:wght@400;700&display=swap');
 body{margin:0;padding:0;background:#121212}
 #capture-area{width:1080px;height:1080px;background-color:#141414;
-background-image:radial-gradient(circle at 50% 45%,rgba(255,42,42,0.09) 0%,rgba(18,18,18,0.95) 70%),url("__BG__");
+background-image:radial-gradient(circle at 50% 45%,rgba(143,227,255,0.09) 0%,rgba(18,18,18,0.95) 70%),url("__BG__");
 background-repeat:no-repeat,repeat;color:white;font-family:'Anonymous Pro',monospace;box-sizing:border-box;
 display:flex;flex-direction:column;align-items:center;justify-content:center;gap:50px;padding:40px 0;position:relative}
 .header{text-align:center;display:flex;flex-direction:column;align-items:center}
-.title-main{font-family:'Orbitron',sans-serif;color:#ff2a2a;font-size:58px;letter-spacing:8px;margin:0;font-weight:900;
-text-shadow:0 0 25px rgba(255,42,42,0.75),0 0 10px rgba(255,42,42,0.5)}
+.title-main{font-family:'Orbitron',sans-serif;color:#8fe3ff;font-size:58px;letter-spacing:8px;margin:0;font-weight:900;
+text-shadow:0 0 25px rgba(143,227,255,0.75),0 0 10px rgba(143,227,255,0.5)}
 .title-sub{font-family:'Orbitron',sans-serif;color:#ffca28;font-size:36px;letter-spacing:12px;margin:4px 0 0 0;font-weight:700;
 text-shadow:0 0 15px rgba(255,202,40,0.5)}
 .leaderboard-container{display:flex;flex-direction:column;gap:20px;width:820px}
 .card{background:rgba(26,26,26,0.95);border-radius:35px;padding:0 45px;height:110px;display:flex;align-items:center;
-border:1px solid rgba(255,42,42,0.35);box-shadow:0 0 25px 4px rgba(255,42,42,0.18);box-sizing:border-box}
+border:1px solid rgba(143,227,255,0.35);box-shadow:0 0 25px 4px rgba(143,227,255,0.18);box-sizing:border-box}
 .rank{font-size:36px;font-weight:700;width:90px;letter-spacing:1px}
 .profile-pic{width:76px;height:76px;border-radius:50%;object-fit:cover;margin-right:35px;border:none}
 .name{font-size:32px;font-weight:700;letter-spacing:3px;flex-grow:1;overflow:hidden;white-space:nowrap}
@@ -525,12 +552,39 @@ PENS_DOWN = [
     "🛑 Pens down! Great grind today, everyone. Leaderboard coming up shortly 🔥",
     "📕 Books closed for today! Thank you all for working hard. The leaderboard will be out in a few minutes ⚡",
     "😮‍💨 That's a wrap, team! Proud of you all. The leaderboard drops in a short while 🏁",
+    "🌙 Day's done, legends! Thanks for putting in the work. Leaderboard dropping shortly ✨",
+    "🧠 Brains off for tonight! You all showed up today. The leaderboard is on its way 📊",
+    "📚 Time to close the books! Thanks for grinding today. Results will be up in a moment ⏰",
+    "🔔 Final bell! Great effort from everyone today. The leaderboard is almost ready 🏆",
+    "🖊️ Pens down, champions! Thank you for the hard work. Hang tight, leaderboard incoming 🚀",
+    "😴 Rest time soon! Thanks for all the effort today. The leaderboard will be out shortly 💫",
+    "🎒 Bags packed, work done! Proud of every one of you. Leaderboard coming right up 🌟",
+    "☕ That's the day wrapped up! Thanks for the grind. Your leaderboard is being prepared 📝",
+    "⌛ Time's up for today! You worked hard, and the leaderboard will be out in a short while 💪",
+    "🌃 Lights down, work done! Thank you all for today. The leaderboard lands in a few minutes 🎯",
+    "🏁 Finish line for today! Thanks for the hard work, everyone. Leaderboard out shortly 🔥",
 ]
+
+def next_pens_down():
+    """Shuffled 'deck': every message is used once before any repeats. Saved in STATE so restarts don't reset it."""
+    bag = [i for i in (STATE.get("pens_bag") or []) if i < len(PENS_DOWN)]
+    if not bag:
+        last = STATE.get("pens_last")
+        bag = list(range(len(PENS_DOWN)))
+        random.shuffle(bag)
+        if last is not None and len(bag) > 1 and bag[-1] == last:
+            bag[0], bag[-1] = bag[-1], bag[0]  # never open a new round with the message just used
+    idx = bag.pop()
+    STATE["pens_bag"] = bag
+    STATE["pens_last"] = idx
+    return PENS_DOWN[idx]
 
 async def roll_to_today():
     async with LOCK:
+        keep_bag, keep_last = STATE.get("pens_bag", []), STATE.get("pens_last")
         STATE.clear()
         STATE.update(fresh_state(now().date()))
+        STATE["pens_bag"], STATE["pens_last"] = keep_bag, keep_last
         await save_state()
 
 async def tick():
@@ -553,7 +607,7 @@ async def tick():
     if not STATE["closed"] and (day < n.date() or n.time() >= dt.time(23, 55)):
         if day == n.date():
             ch = await get_ch(PROGRESS_CH)
-            await ch.send(random.choice(PENS_DOWN), allowed_mentions=NO_MENTIONS)
+            await ch.send(next_pens_down(), allowed_mentions=NO_MENTIONS)
         async with LOCK:
             STATE["closed"] = True
             await save_state()
